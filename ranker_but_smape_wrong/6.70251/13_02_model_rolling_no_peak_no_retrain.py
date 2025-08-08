@@ -1,0 +1,382 @@
+import pandas as pd
+import numpy as np
+import datetime
+import os
+import json
+import random
+import seaborn as sns
+import matplotlib.pyplot as plt
+import optuna
+from tqdm import tqdm
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+from sklearn.feature_selection import SelectFromModel
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.model_selection import train_test_split, KFold, GridSearchCV
+from xgboost import XGBRegressor
+from lightgbm import LGBMRegressor
+from catboost import CatBoostRegressor
+from sklearn.linear_model import RidgeCV
+from sklearn.ensemble import GradientBoostingRegressor
+from lightgbm import early_stopping, log_evaluation
+from sklearn.neighbors import NearestNeighbors
+from sklearn.base import clone
+
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+
+print("[13_02_model] 시작")
+
+seed_file = "./Energy/13_submission/(SEED_COUNT)13_02_model.json"
+
+# 파일이 없으면 처음 생성
+if not os.path.exists(seed_file):
+    seed_state = {"seed": 42}
+else:
+    with open(seed_file, "r") as f:
+        seed_state = json.load(f)
+
+# 현재 seed 값 사용
+SEED = 56 #seed_state["seed"]
+print(f"[Current Run SEED]: {SEED}")
+
+# 다음 실행을 위해 seed 값 1 증가
+seed_state["seed"] += 1
+with open(seed_file, "w") as f:
+    json.dump(seed_state, f)
+
+random.seed(SEED)
+np.random.seed(SEED)
+
+print(f"[1] 데이터 로드 및 전처리 (생략 - 기존 코드에서 이미 수행)")
+data_path = './Energy/'
+save_path = './Energy/13_submission/'
+train_save_path = './Energy/13_submission/train_csv/'
+test_save_path = './Energy/13_submission/test_csv/'
+os.makedirs(train_save_path, exist_ok=True)
+os.makedirs(test_save_path, exist_ok=True)
+os.makedirs(save_path, exist_ok=True)
+
+# Preprocessed data 로드
+train_call = '13_01_train_SEED65_up.csv'
+test_call = '13_01_test_SEED65_up.csv'
+
+train = pd.read_csv(train_save_path + train_call)
+test = pd.read_csv(test_save_path + test_call)
+samplesub = pd.read_csv(data_path +'sample_submission.csv')
+
+# '일시' 컬럼을 datetime 형식으로 변환 (변화량 계산을 위해 필요)
+train['일시'] = pd.to_datetime(train['일시'])
+test['일시'] = pd.to_datetime(test['일시'])
+
+# 건물별로 그룹화하여 특정 컬럼의 롤링 변화량을 계산하는 함수
+def add_rolling_diff_features(df, col_name, hours_list):
+    """
+    주어진 데이터프레임에 건물별로 특정 컬럼의 롤링 변화량 특성을 추가합니다.
+    
+    Args:
+        df (pd.DataFrame): 원본 데이터프레임.
+        col_name (str): 변화량을 계산할 컬럼 이름 (예: '일조(hr)').
+        hours_list (list): 계산할 시간 간격 리스트 (예: [1, 2, 3]은 1시간, 2시간, 3시간 변화량).
+        
+    Returns:
+        pd.DataFrame: 변화량 특성이 추가된 데이터프레임.
+    """
+    df_copy = df.copy()
+    
+    # 각 건물별로 그룹화하여 변화량 계산
+    for building_id in df_copy['건물번호'].unique():
+        building_df_idx = df_copy[df_copy['건물번호'] == building_id].index
+        building_df = df_copy.loc[building_df_idx].sort_values(by='일시') # 시간 순서로 정렬
+        
+        for h in hours_list:
+            new_col_name = f"{col_name.split('(')[0]}_변화량_{h}h" # '일조(hr)' -> '일조_변화량_1h'
+            df_copy.loc[building_df_idx, new_col_name] = building_df[col_name].diff(periods=h).values
+            
+    # 변화량 계산 후 생긴 NaN 값은 0으로 채우거나 적절히 처리 (여기서는 0으로 채움)
+    # NaN 값은 주로 시계열의 시작 부분에서 발생
+    for h in hours_list:
+        new_col_name = f"{col_name.split('(')[0]}_변화량_{h}h"
+        if new_col_name in df_copy.columns:
+            df_copy[new_col_name] = df_copy[new_col_name].fillna(0)
+            
+    return df_copy
+
+print("[2] 일조 및 일사 변화량 특성 추가 시작")
+# 일조(hr) 변화량 특성 추가
+train = add_rolling_diff_features(train, '일조(hr)', [1, 2, 3])
+test = add_rolling_diff_features(test, '일조(hr)', [1, 2, 3])
+
+# 일사(MJ/m2) 변화량 특성 추가
+train = add_rolling_diff_features(train, '일사(MJ/m2)', [1, 2, 3])
+test = add_rolling_diff_features(test, '일사(MJ/m2)', [1, 2, 3])
+print("[2] 일조 및 일사 변화량 특성 추가 완료")
+
+# print(train.columns)
+# print(test.columns)
+# exit()
+def smape(y_true, y_pred):
+    numerator = np.abs(y_pred - y_true)
+    denominator = (np.abs(y_true) + np.abs(y_pred)) / 2
+    ratio = np.where(denominator == 0, 0, numerator / denominator)
+    return 100 * np.mean(ratio)
+
+def one_hot_building_id(df):
+    temp = pd.get_dummies(df['건물번호'], prefix='건물')
+    df = pd.concat([df, temp], axis=1)
+    return df
+
+train = one_hot_building_id(train)
+test = one_hot_building_id(test)
+
+# 새로운 변화량 특성들을 features 리스트에 추가
+exclude_cols = ['건물번호', '일시', '전력소비량(kWh)', '건물유형', '날짜']
+features = [col for col in train.columns if col not in exclude_cols]
+
+# 추가된 변화량 특성들이 features에 포함되었는지 확인 (선택 사항)
+new_diff_features = [
+    '일조_변화량_1h', '일조_변화량_2h', '일조_변화량_3h',
+    '일사_변화량_1h', '일사_변화량_2h', '일사_변화량_3h'
+]
+for new_feat in new_diff_features:
+    if new_feat not in features:
+        features.append(new_feat) # 혹시 빠졌다면 추가
+
+target = '전력소비량(kWh)'
+
+N_SPLIT = 5
+KFOLD = KFold(n_splits=N_SPLIT, shuffle=True, random_state=SEED)
+
+def train_and_predict_subset(train_subset, test_subset, name="Subset"):
+    X_train_full = train_subset[features].reset_index(drop=True)
+    y_train_full = np.log1p(train_subset[target].reset_index(drop=True))
+    X_test = test_subset[features].reset_index(drop=True)
+
+    oof_preds_lvl1 = np.zeros((len(X_train_full), 3)) # xgb, lgb, cat
+    test_preds_lvl1 = np.zeros((len(X_test), 3))
+
+    for fold, (train_idx, val_idx) in enumerate(KFOLD.split(X_train_full, y_train_full)):
+        X_train, X_val = X_train_full.iloc[train_idx], X_train_full.iloc[val_idx]
+        y_train, y_val = y_train_full.iloc[train_idx], y_train_full.iloc[val_idx]
+
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_val_scaled = scaler.transform(X_val)
+        X_test_scaled = scaler.transform(X_test)
+
+        xgb_model = XGBRegressor(objective='reg:squarederror', random_state=SEED, n_estimators=500, learning_rate=0.05, max_depth=6, subsample=0.8, colsample_bytree=0.8, n_jobs=-1)
+        lgb_model = LGBMRegressor(objective='mae', random_state=SEED, n_estimators=500, learning_rate=0.05, num_leaves=31, max_depth=-1, feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, n_jobs=-1, verbose=-1)
+        cat_model = CatBoostRegressor(loss_function='MAE', random_seed=SEED, n_estimators=500, learning_rate=0.05, depth=6, l2_leaf_reg=3, verbose=0)
+        
+        xgb_model.fit(X_train_scaled, y_train)
+        lgb_model.fit(X_train_scaled, y_train)
+        cat_model.fit(X_train_scaled, y_train)
+
+        oof_preds_lvl1[val_idx, 0] = xgb_model.predict(X_val_scaled)
+        oof_preds_lvl1[val_idx, 1] = lgb_model.predict(X_val_scaled)
+        oof_preds_lvl1[val_idx, 2] = cat_model.predict(X_val_scaled)
+
+        test_preds_lvl1[:, 0] += xgb_model.predict(X_test_scaled) / N_SPLIT
+        test_preds_lvl1[:, 1] += lgb_model.predict(X_test_scaled) / N_SPLIT
+        test_preds_lvl1[:, 2] += cat_model.predict(X_test_scaled) / N_SPLIT
+    
+    meta_model = RidgeCV()
+    meta_model.fit(oof_preds_lvl1, y_train_full)
+
+    oof_pred_final = meta_model.predict(oof_preds_lvl1)
+    test_pred_final = meta_model.predict(test_preds_lvl1)
+    
+    # With peak model removed, these are directly the final predictions for the subset
+    oof_pred_final_combined = oof_pred_final
+    test_pred_final_combined = test_pred_final
+    
+    current_smape = smape(np.expm1(y_train_full), np.expm1(oof_pred_final_combined))
+    print(f"     > {name} SMAPE: {current_smape:.6f}")
+
+    return oof_pred_final_combined, test_pred_final_combined, current_smape
+
+
+# --- 1. 유형별 사전학습 및 예측 ---
+print("\n--- [Step 1] 건물유형별 사전학습 및 예측 시작 ---")
+
+type_wise_oof_preds = np.zeros(len(train))
+type_wise_test_preds = np.zeros(len(test))
+type_wise_smapes = []
+type_wise_results = {} # Store results for conditional re-training
+
+building_types = train['건물유형'].unique()
+
+for btype in building_types:
+    print(f"     > 건물유형: {btype} 모델 학습 시작 (KFold 교차 검증 적용)")
+    train_bt = train[train['건물유형'] == btype].copy()
+    test_bt = test[test['건물유형'] == btype].copy()
+
+    if len(train_bt) == 0 or len(test_bt) == 0:
+        continue # Skip if no data for this type in train or test
+
+    oof_pred, test_pred, current_smape = train_and_predict_subset(train_bt, test_bt, name=f"Type {btype}")
+    
+    type_wise_smapes.append(current_smape)
+    type_wise_oof_preds[train_bt.index] = oof_pred
+    type_wise_test_preds[test_bt.index] = test_pred
+    type_wise_results[btype] = {"smape": current_smape, "train_indices": train_bt.index, "test_indices": test_bt.index}
+
+print("--- [Step 1] 건물유형별 사전학습 및 예측 완료 ---")
+final_type_wise_smape = np.mean(type_wise_smapes)
+print(f"--- 평균 SMAPE (유형별): {final_type_wise_smape:.6f} ---")
+
+
+# --- 2. 건물별 사전학습 및 예측 ---
+print("\n--- [Step 2] 건물별 사전학습 및 예측 시작 ---")
+
+building_wise_oof_preds = np.zeros(len(train))
+building_wise_test_preds = np.zeros(len(test))
+building_wise_smapes = []
+building_wise_results = {} # Store results for conditional re-training
+
+building_ids = train['건물번호'].unique()
+
+for bno in building_ids:
+    print(f"     > 건물번호: {bno} 모델 학습 시작 (KFold 교차 검증 적용)")
+    train_b = train[train['건물번호'] == bno].copy()
+    test_b = test[test['건물번호'] == bno].copy()
+
+    if len(train_b) == 0 or len(test_b) == 0:
+        continue # Skip if no data for this building in train or test
+
+    oof_pred, test_pred, current_smape = train_and_predict_subset(train_b, test_b, name=f"Building {bno}")
+    
+    building_wise_smapes.append(current_smape)
+    building_wise_oof_preds[train_b.index] = oof_pred
+    building_wise_test_preds[test_b.index] = test_pred
+    building_wise_results[bno] = {"smape": current_smape, "train_indices": train_b.index, "test_indices": test_b.index}
+
+
+print("--- [Step 2] 건물별 사전학습 및 예측 완료 ---")
+final_building_wise_smape = np.mean(building_wise_smapes)
+print(f"--- 평균 SMAPE (건물별): {final_building_wise_smape:.6f} ---")
+
+
+building_groups = [
+    [28],                                                               # 강릉
+    [72],                                                               # 경주시
+    [19,58,75,91],                                                      # 광주
+    [77],                                                               # 부안
+    [24],                                                               # 구미
+    [61,74,81],                                                         # 김해시
+    [32,42,65,79,99],                                                   # 대구
+    [11,12,13,41,68,83,88],                                             # 대전
+    [20,26,44,45,70,100],                                               # 부산
+    [1,2,3,4,5,6,7,8,27,33,34,35,37,47,67,86,96],                       # 서울
+    [71],                                                               # 세종
+    [54,84],                                                            # 속초
+    [17,18,29,30,31,40,43,48,49,51,52,53,60,63,64,76,78],               # 수원
+    [66],                                                               # 안동
+    [85],                                                               # 양산시
+    [55,82],                                                            # 울산
+    [15,16,39,59,73,92],                                                # 인천
+    [80,87],                                                            # 임실
+    [89,90],                                                            # 전주
+    [98],                                                               # 제천
+    [50],                                                               # 진주
+    [21,22,23],                                                         # 창원
+    [46,93,94,95],                                                      # 천안
+    [14,69],                                                            # 청주
+    [57],                                                               # 춘천
+    [97],                                                               # 충주
+    [36,38,56],                                                         # 파주
+    [25,62],                                                            # 포항
+    [9,10],                                                             # 홍천 
+]
+print("\n--- [Step 3] 건물 그룹별 예측 시작 ---")
+
+group_oof_preds = np.zeros(len(train))
+group_test_preds = np.zeros(len(test))
+group_smapes = []
+group_results = {} # Store results for conditional re-training
+
+for group_idx, group in enumerate(building_groups):
+    print(f"     > 그룹 {group_idx+1}: 건물들 {group} 모델 학습 시작")
+
+    train_g = train[train['건물번호'].isin(group)].copy()
+    test_g = test[test['건물번호'].isin(group)].copy()
+
+    if len(train_g) < 10 or len(test_g) < 1:
+        print(f"     > 그룹 {group_idx+1} (건물: {group}) 데이터 부족으로 건너뜀.")
+        continue    # 너무 작은 그룹 제외
+
+    oof_pred, test_pred, current_smape = train_and_predict_subset(train_g, test_g, name=f"Group {group_idx+1}")
+    
+    group_smapes.append(current_smape)
+    group_oof_preds[train_g.index] = oof_pred
+    group_test_preds[test_g.index] = test_pred
+    group_results[group_idx] = {"smape": current_smape, "train_indices": train_g.index, "test_indices": test_g.index, "buildings": group}
+
+
+print("--- [Step 3] 건물 그룹별 예측 완료 ---")
+final_group_wise_smape = np.mean(group_smapes)
+print(f"--- 평균 SMAPE (그룹별): {final_group_wise_smape:.6f} ---")
+
+# --- 4. 잔차 학습 및 최종 예측 ---
+print("\n--- [Step 4] 잔차 학습 및 최종 예측 시작 ---")
+
+# 예측 평균
+ensemble_oof_preds = (type_wise_oof_preds + building_wise_oof_preds + group_oof_preds) / 3
+ensemble_test_preds = (type_wise_test_preds + building_wise_test_preds + group_test_preds) / 3
+
+# 잔차 계산
+y_true_log = np.log1p(train[target])
+residuals = y_true_log - ensemble_oof_preds
+
+# 잔차 모델 (LGBMRegressor)
+# 잔차 모델을 위한 고정 하이퍼파라미터
+residual_model = LGBMRegressor(objective='mae', random_state=SEED, n_estimators=300, 
+                               learning_rate=0.05, num_leaves=31, max_depth=-1, n_jobs=-1, verbose=-1)
+
+# 잔차 모델 학습을 위한 피처 스케일링
+scaler_res = StandardScaler()
+X_train_scaled_res = scaler_res.fit_transform(train[features])
+X_test_scaled_res = scaler_res.transform(test[features])
+
+# 전체 훈련 데이터로 잔차 모델 학습
+residual_model.fit(X_train_scaled_res, residuals)
+
+# 테스트 데이터에 대한 잔차 예측
+predicted_residuals = residual_model.predict(X_test_scaled_res)
+
+# 최종 예측: 앙상블 예측 + 예측된 잔차
+final_preds_residual = ensemble_test_preds + predicted_residuals
+
+# 예측값이 음수가 되지 않도록 하고 원래 스케일로 변환
+final_predictions_exp = np.expm1(final_preds_residual)
+final_predictions_exp[final_predictions_exp < 0] = 0 # 음수 값 0으로 처리
+
+# 최종 OOF SMAPE 계산 (모델 성능 평가용)
+final_oof_combined_preds = ensemble_oof_preds + residual_model.predict(X_train_scaled_res)
+final_oof_smape = smape(np.expm1(y_true_log), np.expm1(final_oof_combined_preds))
+
+print(f"--- [Step 4] 잔차 학습 및 최종 예측 완료 ---")
+print(f"최종 SMAPE (잔차 모델링 후): {final_oof_smape:.6f}")
+
+print("[3] 예측 결과 저장 시작")
+samplesub['answer'] = final_predictions_exp
+today = datetime.datetime.now().strftime('%Y%m%d')
+score_str = f"{final_oof_smape:.4f}".replace('.', '_')
+
+filename = f"13_02_{today}_SMAPE_{score_str}.csv"
+samplesub.to_csv(save_path + filename, index=False)
+
+with open("./Energy/13_submission/(LOG)13_02_model.txt", "a") as f:
+    f.write(f"<파일명 : 13_02_model_rolling_no_peak_no_retrain.py>\n") # Updated filename
+    f.write(f"<SEED :{SEED}>\n")
+    f.write(f"사용된 파일:\n")
+    f.write(f"{train_call} / {test_call}\n")
+    f.write(f"저장된 파일:\n")
+    f.write(f"{filename}\n")
+    f.write(f"peak_model_removed: True\n") # Added a flag
+    f.write(f"건물 유형별 학습 SMAPE : {final_type_wise_smape:.6f}\n")
+    f.write(f"건물 번호별 학습 SMAPE : {final_building_wise_smape:.6f}\n")
+    f.write(f"건물 그룹별 학습 SMAPE : {final_group_wise_smape:.6f}\n") 
+    f.write(f"잔차학습 SMAPE : {final_oof_smape:.6f}\n")
+    f.write("="*40 + "\n")
+
+print(f"[4] 종료 ")
